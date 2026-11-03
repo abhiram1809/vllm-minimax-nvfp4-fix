@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import pytest
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.parser.abstract_parser import DelegatingParser
 from vllm.reasoning import ReasoningParserManager
 from vllm.reasoning.minimax_m3_reasoning_parser import MiniMaxM3ReasoningParser
 
@@ -494,3 +495,65 @@ def test_streaming_end_check_ignores_prompt_markers():
     assert parser.is_reasoning_end_streaming(
         prompt_ids + open_ids + closed_ids, closed_ids
     )
+
+
+class MiniMaxM3DelegatingParser(DelegatingParser):
+    reasoning_parser_cls = MiniMaxM3ReasoningParser
+
+
+def run_parse_delta(
+    chunks: list[str], prompt: str = PROMPT, **chat_template_kwargs
+) -> tuple[str, str]:
+    """Stream ``chunks`` through the frontend ``parse_delta`` path, which is the
+    path that decides from the rendered prompt whether reasoning is still open."""
+    tokenizer = MiniMaxM3Tokenizer()
+    parser = MiniMaxM3DelegatingParser(
+        tokenizer, chat_template_kwargs=chat_template_kwargs or None
+    )
+    request = ChatCompletionRequest(messages=[], model="test-model")
+    prompt_ids = tokenizer.encode(prompt)
+    reasoning: list[str] = []
+    content: list[str] = []
+    for i, chunk in enumerate(chunks):
+        delta = parser.parse_delta(
+            chunk,
+            tokenizer.encode(chunk),
+            request,
+            prompt_token_ids=prompt_ids if i == 0 else None,
+            finished=i == len(chunks) - 1,
+        )
+        if delta is not None:
+            reasoning.append(delta.reasoning or "")
+            content.append(delta.content or "")
+    return "".join(reasoning), "".join(content)
+
+
+def test_parse_delta_splits_reasoning_when_prompt_spells_out_markers():
+    # Regression: the template spells out "<mm:think></mm:think>" in the system
+    # message and earlier turns carry closers. Reading the whole prompt made the
+    # frontend think reasoning had already ended, so the entire
+    # "<mm:think>plan</mm:think>answer" block was streamed as content.
+    reasoning, content = run_parse_delta(
+        ["<mm:think>", "plan", "</mm:think>", "answer"]
+    )
+
+    assert reasoning == "plan"
+    assert content == "answer"
+
+
+def test_parse_delta_without_reasoning_block_is_all_content():
+    reasoning, content = run_parse_delta(["plain ", "answer"])
+
+    assert reasoning == ""
+    assert content == "plain answer"
+
+
+def test_parse_delta_keeps_quoted_closer_in_content():
+    # A closer the answer writes on purpose is content, in streaming as in
+    # non-streaming (see test_nonstreaming_non_leading_end_tag_is_content).
+    reasoning, content = run_parse_delta(
+        ["<mm:think>", "plan", "</mm:think>", "tag is ", "</mm:think>", " ok"]
+    )
+
+    assert reasoning == "plan"
+    assert content == "tag is </mm:think> ok"
